@@ -1,8 +1,6 @@
-import { Controller, FileTypeValidator, Get, ParseFilePipe, Post, Res, UploadedFile, UseInterceptors, Param, Body } from '@nestjs/common';
+import { Controller, FileTypeValidator, Get, ParseFilePipe, Post, Res, UploadedFile, UseInterceptors, Param, Body, CacheInterceptor, CacheTTL } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { Response } from 'express';
-import { createReadStream, readFileSync, writeFile } from 'fs';
-import { join } from 'path';
 import { FileService } from './file.service';
 
 @Controller('file')
@@ -15,6 +13,7 @@ export class FileController {
     async uploadFile(@UploadedFile(
         new ParseFilePipe({
             validators: [
+                // TODO: this validation only check file extensions, it's need proper validation that check the file it self 
                 new FileTypeValidator({ fileType: '.(png|jpg|pdf)' }),
             ],
         })
@@ -29,7 +28,7 @@ export class FileController {
 
     @Get(':id')
     async getFile(@Param('id') param, @Res() res: Response) {
-        res.send(await this.fileService.findOneFile(param.id))
+        res.send(await this.fileService.findOneFile(param))
     }
 
     @Post(':id/generate')
@@ -37,13 +36,19 @@ export class FileController {
         @Param('id') param,
         @Body() body: { duration: number },
         @Res() res: Response) {
-
-        res.send(await this.fileService.generateTmpUrl(param.id, body.duration))
+        res.contentType('application/json')
+        res.send(await this.fileService.generateTmpUrl(param, body.duration))
     }
 
+
     @Get(':uuid/tmp')
-    async getFileBinary(@Param('uuid') param, 
-    @Res() res: Response) {
-        res.send(await this.fileService.getTmpFile(param))
+    async getFileBinary(@Param('uuid') param,
+        @Res() res: Response) {
+        const file = await this.fileService.getTmpFile(param);
+        res.contentType('application/octet-stream');
+        if (file.message)
+            res.contentType('application/json');
+        res.send(file);
+
     }
 }

@@ -1,5 +1,5 @@
 import { HttpService } from '@nestjs/axios/dist';
-import { Injectable, Logger } from '@nestjs/common';
+import { CACHE_MANAGER, Inject, Injectable, Logger } from '@nestjs/common';
 import { catchError, firstValueFrom } from 'rxjs';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -7,23 +7,24 @@ import { InjectRepository } from "@nestjs/typeorm";
 import { Repository } from "typeorm";
 import { File } from '../entity/file.entity';
 import { FileUrls } from 'src/entity/fileUrls.entity';
+import { Cache } from 'cache-manager';
 
 
 
 
 @Injectable()
 export class FileService {
-
     private readonly logger = new Logger(FileService.name);
 
     baseUrl = process.env.DROPBOX_BASE_URL;
-
 
     constructor(private readonly httpService: HttpService,
         @InjectRepository(File)
         private fileRepository: Repository<File>,
         @InjectRepository(FileUrls)
-        private fileUrlsRepository: Repository<FileUrls>) { }
+        private fileUrlsRepository: Repository<FileUrls>,
+        @Inject(CACHE_MANAGER) private cacheService: Cache,
+    ) { }
 
     findAllFile(): Promise<File[]> {
         return this.fileRepository.find();
@@ -41,11 +42,14 @@ export class FileService {
         return this.fileUrlsRepository.save(fileUrl);
     }
 
-
     findFileUrl(uuid: string): Promise<FileUrls> {
-        console.log(uuid);
-        
-        return this.fileUrlsRepository.findOneBy({ uuid });
+        return this.fileUrlsRepository
+            .createQueryBuilder('url')
+            .select(['url.id', 'url.uuid', 'url.duration', 'url.createdAt'])
+            .leftJoinAndSelect('url.file', 'file', 'url.fileId = file.id')
+            .addSelect(['file.type'])
+            .where('url.uuid = :uuid', { uuid })
+            .getOne();
     }
 
     async apiPost(url: string, file: any, headers) {
@@ -53,29 +57,7 @@ export class FileService {
             ...headers, Authorization: `Bearer ${process.env.DROPBOX_TOKEN}`
         }
 
-        const { data, headers: h } = await firstValueFrom(
-            this.httpService.post(url, file,
-                {
-                    baseURL: 'https://content.dropboxapi.com/2',
-                    headers,
-                }).pipe(
-                    catchError((error: any) => {
-                        this.logger.error(error.response.data);
-                        throw 'An error happened!';
-                    }),
-                ),
-        );
-
-        return { data, h };
-    }
-
-
-    async apiSaveFile(url: string, file: any, headers) {
-        headers = {
-            ...headers, Authorization: `Bearer ${process.env.DROPBOX_TOKEN}`
-        }
-
-        const { data, headers: h } = await firstValueFrom(
+        const { data } = await firstValueFrom(
             this.httpService.post(url, file,
                 {
                     baseURL: this.baseUrl,
@@ -87,17 +69,11 @@ export class FileService {
                     }),
                 ),
         );
-
-
-        return { data, h };
+        return data;
     }
 
-    getAllFile(): any {
-        return 'All files'
-    }
-    test = []
     async saveFile(file: any) {
-        const { data, h: headers } = await this.apiPost('/files/upload', file.buffer, { 'Content-Type': 'application/octet-stream', 'Dropbox-API-Arg': `{ "path": "/uploads/${file.originalname}" }` });
+        const data = await this.apiPost('/files/upload', file.buffer, { 'Content-Type': 'application/octet-stream', 'Dropbox-API-Arg': `{ "path": "/uploads/${file.originalname}" }` });
         const fileDbData: File = {
             name: data.name,
             type: file.mimetype,
@@ -106,12 +82,12 @@ export class FileService {
             createdAt: data.server_modified,
             updatedAt: data.server_modified,
         }
+        //TODO: need validation to prevent adding the same file
         return this.createFile(fileDbData);
     }
 
-    async getFileById(id: string) {
-        const res = await this.apiSaveFile('/files/download', '', { 'Content-Type': 'application/octet-stream', 'Dropbox-API-Arg': `{ "path": "/uploads/images (4).png" }` })
-        return { data: res.data, headers: res.h };
+    async getFileByPath(path: string) {
+        return this.apiPost('/files/download', '', { 'Content-Type': 'application/octet-stream', 'Dropbox-API-Arg': `{ "path": "${path}" }` })
     }
 
 
@@ -130,24 +106,32 @@ export class FileService {
 
         await this.createFileUrl(fileUrlCreateDate);
 
+        // TODO: this will not work in producation, maybe use env here
         return { tmpUrl: `http://localhost:3000/file/${genratedUuid}/tmp` }
-        // return {tmpUrl: `${process.env.HOSTNAME}/${genratedUuid}`}
     }
 
+    //TODO: refactor leater, i don't like it
     async getTmpFile(uuid: string) {
-        const fileUrl = await this.findFileUrl(uuid)
-        
+        const fileUrl = await this.findFileUrl(uuid);
+        if (!fileUrl) return { message: 'This is expired URL' };
         const urlTime = new Date(fileUrl.createdAt).getTime();
         const timeNow = new Date().getTime();
 
         const timeDiff = Math.round((timeNow - urlTime) / 60000)
-
         const isValidUrl = timeDiff <= fileUrl.duration;
-        if(isValidUrl)
-        return this.findOneFile(fileUrl.fileId);
-        return {message: 'This is expired URL'};
+
+        if (isValidUrl && fileUrl.file.type.includes('image')) {
+            const chachedFile = await this.cacheService.get(uuid);
+            if (chachedFile) {
+                return chachedFile;
+            }
+        }
+        const fileBinery = await this.getFileByPath(fileUrl.file.path);
+        if (fileUrl.file.type.includes('image'))
+            await this.cacheService.set(uuid, fileBinery);
+        if (isValidUrl)
+            return fileBinery;
+        return { message: 'This is expired URL' };
 
     }
-
 }
-
